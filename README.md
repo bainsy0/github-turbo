@@ -1,14 +1,14 @@
 # GitHub Turbo · GitHub 高速通道
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.0.0-blue.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-1.0.1-blue.svg">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green.svg">
   <img alt="UserScript" src="https://img.shields.io/badge/UserScript-Tampermonkey%20%7C%20Violentmonkey%20%7C%20ScriptCat-orange.svg">
 </p>
 
 一个给 GitHub 页面加「高速通道」的用户脚本（UserScript）：自动测速挑选可用镜像，给 Releases 附件、源码包、Raw 文件、Gist 加上一键加速入口；节点失效会自动降级回直连，不产生死链。
 
-- 当前版本：v1.0.0，2026-10-31
+- 当前版本：v1.0.1，2026-10-31
 - 适用：Tampermonkey / Violentmonkey / ScriptCat（Chrome / Edge / Firefox）
 - 匹配范围：`github.com`、`gist.github.com`、`raw.githubusercontent.com`、`gist.githubusercontent.com`，`document-start` 注入、不在 iframe 内运行
 - 运行时依赖：无，单文件、无构建步骤
@@ -38,7 +38,7 @@
 
 ### 方式二：本地安装页（Windows）
 
-双击 [`serve.bat`](./serve.bat)：会在本机 `8765` 端口起一个静态服务，并用浏览器打开安装页。
+双击 [`serve.bat`](./serve.bat)：会在本机 `8765` 端口起一个静态服务，并用浏览器打开安装页。改完 `github-turbo.js` 后要重新运行一次 `serve.bat`，否则 `.serve/` 里还是上次的副本。
 
 脚本管理器的规矩是「地址以 `.user.js` 结尾才会弹安装页」，而本仓库的文件叫 `github-turbo.js`，所以 `serve.bat` 启动时会把它复制成 `.serve/github-turbo.user.js` 再打开该地址（`.serve/` 已在 `.gitignore` 中，源码始终只有 `github-turbo.js` 一份）。
 
@@ -53,6 +53,8 @@ https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/github-turb
 ```
 
 - **只有 `github-turbo.js`**：直接打开 raw 地址只会显示源码，全选复制后按「方式一」粘贴保存即可，效果相同。
+
+> 脚本头部的 `@namespace` / `@homepageURL` / `@supportURL` / `@updateURL` / `@downloadURL` 目前填的是 `Bainsy0/github-turbo`，发布到你自己的仓库时记得一起改。`@updateURL` 指向 raw 地址，装好后脚本管理器可在网络允许时自动检查更新（raw 域名被墙时不会成功，只能手动覆盖安装）。
 
 > 首次运行时，脚本管理器会请求 `*` 域名的跨域权限（用于自定义镜像与 GitHub API）。如不放心，可把脚本头部的 `@connect *` 改回具体域名。
 
@@ -113,49 +115,57 @@ https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/github-turb
 - 镜像方理论上能看到并修改下载内容；下载可执行文件时建议核对 Release 给出的 sha256。
 - jsdelivr 有单文件大小上限（约 20MB），大文件会失败并回退直连。
 - 图片加速（头像 / issue 配图）为实验功能，默认关闭；部分节点已不支持 avatar 路线，开启后可能直接走原图。
+- secret gist 只能尽力识别（GitHub 没有稳定标记）：识别不到时仍会照常走镜像，处理敏感 gist 前请手动关掉加速。
+- Release 增强显示依赖 GitHub 当前页面结构（`summary` 里的 "assets"、`octolytics-*` meta、`data-testid`）。GitHub 改版后这部分可能静默失效，此时只有加速功能仍可用。
+- `@updateURL` 指向 `raw.githubusercontent.com`，该域名在部分网络下不可达，脚本管理器可能无法自动检查更新，必要时按「安装」里任一种方式覆盖安装。
 
 ## 项目结构
 
 ```text
 .
-├── github-turbo.js        # 用户脚本（唯一运行时代码）
+├── github-turbo.js              # 用户脚本（唯一运行时代码）
 ├── README.md
 ├── CHANGELOG.md
-├── LICENSE
-├── serve.bat              # Windows 本地安装页（起 8765 端口，生成 .serve/ 别名后打开）
-├── .github/workflows/     # CI（check.yml）：推送时做 node --check 语法检查
+├── LICENSE                      # MIT
+├── serve.bat                    # Windows 本地安装页（8765 端口，生成 .serve/ 别名后打开）
+├── scripts/check.js             # 静态自检（node scripts/check.js，CI 跑同一份）
+├── .github/workflows/check.yml  # CI：node --check + scripts/check.js
 ├── .editorconfig
-├── .gitattributes
-└── .gitignore
+├── .gitattributes               # *.bat 固定 CRLF
+└── .gitignore                   # 忽略 .serve/ 等本地产物
 ```
 
 ## 开发与校验
 
-本项目没有构建步骤，改完直接刷新页面即可。提交前至少做一次语法检查（Node.js 18+，CI 也会跑）：
+本项目没有构建步骤，改完直接刷新页面即可。提交前跑一遍自检（Node.js 18+，CI 也是这两条）：
 
 ```bash
 node --check github-turbo.js
+node scripts/check.js
 ```
+
+[`scripts/check.js`](./scripts/check.js) 不依赖任何包，专查「改一处忘一处」的四类问题：三处版本号是否一致（脚本 `@version`、本文「当前版本」、`CHANGELOG.md` 最新条目）、README 节点表行数与脚本 `MIRRORS` 是否对得上、README 里的相对链接是否都存在、`serve.bat` 的 `FILE` 与 CRLF 换行是否正常。
 
 修改节点表、能力或默认配置时，请同步更新 README 的节点表与 [`CHANGELOG.md`](./CHANGELOG.md)；改动用户可见的开关或菜单项，也要同步本文的「功能 / 使用」两节。
 
-> 给脚本文件改名时，记得同时改 `serve.bat` 里的 `FILE` 与 [`.github/workflows/check.yml`](./.github/workflows/check.yml) 里的 `node --check` 路径，否则本地安装页会 404、CI 会失败。
+> 给脚本文件改名时，记得同时改 `serve.bat` 里的 `FILE` 与 [`check.yml`](./.github/workflows/check.yml) 里的检查路径，否则本地安装页会 404、CI 会失败。
 
-### 验证记录
+### 发布前自查
 
-第一版发布前已完成：jsdom 冒烟 32 项（附件注入与排序、切换节点后按钮重画、镜像套镜像剥离、查询串式自定义前缀、私有仓库跳过、全节点失败回退直连、精确时间开关与还原、下载量与推荐徽章）。
+仓库里不放 DOM 测试，页面相关的检查发布前按下面清单人工过一遍（v1.0.1 已执行前两项）：
 
-早期开发版发布前已完成：
+- [x] `node --check github-turbo.js` 与 `node scripts/check.js` 通过（CI 同样执行）
+- [x] README 的节点表、默认开关、版本号与脚本常量逐项核对
+- [ ] Chrome + Tampermonkey、Firefox + Violentmonkey、Edge + ScriptCat 各跑一次：悬浮球、测速、附件按钮、raw 工具条
+- [ ] 私有仓库与 secret gist 页面确认不注入加速按钮
+- [ ] 下载一个 Release 附件与一个源码包，核对 MZ / PK 文件头
+- [ ] 关闭总开关后确认页面上没有残留的加速入口
 
-- jsdom 全量单测 196 项（DOM 注入、点击拦截、私有仓库、测速择优、缓存持久化）；
-- 真实 Edge 渲染与交互 56 项（浅色 / 深色 / 窄屏、按钮排版、点击跳转）；
-- 真实网络 20 项（测速、真实下载并校验 MZ / PK 文件头、真实 Releases 页面与文件列表注入）。
-
-> 测试与节点探测脚本属于开发期工具，已按整理要求移除；本仓库只保留可直接安装的成品。
+> 早期的 jsdom 冒烟、真实 Edge 渲染与真实网络下载属于开发期检查，脚本未随仓库发布；需要时按上面的清单手工覆盖。
 
 ## 更新日志
 
-见 [`CHANGELOG.md`](./CHANGELOG.md)。当前版本 **第一版**（v1.0.0，2026-10-31）。
+完整记录见 [`CHANGELOG.md`](./CHANGELOG.md)。当前 **v1.0.1**（2026-10-31）：修正油猴 API 取用方式（兼容 Violentmonkey / ScriptCat）、Linux 包格式的排序与推荐、raw 地址上多余的查询串；同时补齐 `LICENSE`、CI 等仓库文件。v1.0.0 是首个版本。
 
 ## 参考
 

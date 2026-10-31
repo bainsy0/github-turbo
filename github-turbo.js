@@ -1,11 +1,15 @@
 // ==UserScript==
 // @name         GitHub 高速通道 · GitHub Turbo
 // @name:zh-CN   GitHub 高速通道
-// @namespace    https://github.com/gh-turbo
-// @version      1.0.0
+// @namespace    https://github.com/Bainsy0/github-turbo
+// @version      1.0.1
 // @description  给 GitHub 页面加一条高速通道：19 个镜像节点自动测速择优、失败自动降级，Releases / 源码包 / Raw / Gist / 头像一键加速；Release 附件按你的系统与架构排序并标出推荐、显示下载量、精确时间、折叠更新日志；raw 页面另有一键镜像下载工具条。
 // @author       Bainsy0
 // @license      MIT
+// @homepageURL  https://github.com/Bainsy0/github-turbo
+// @supportURL   https://github.com/Bainsy0/github-turbo/issues
+// @updateURL    https://raw.githubusercontent.com/Bainsy0/github-turbo/main/github-turbo.js
+// @downloadURL  https://raw.githubusercontent.com/Bainsy0/github-turbo/main/github-turbo.js
 // @match        https://github.com/*
 // @match        https://gist.github.com/*
 // @match        https://raw.githubusercontent.com/*
@@ -28,6 +32,32 @@
   if (window.__GHA_LOADED__) return;
   window.__GHA_LOADED__ = true;
 
+  /* ── 油猴 API 取用 ──────────────────────────────────────────
+   * GM_* 的规范位置是「脚本作用域」（@grant 声明后注入的裸标识符），
+   * 并不保证是 window 的属性；Tampermonkey / Violentmonkey / ScriptCat
+   * 的沙箱实现各不相同。只认 window.GM_xxx 时，某些组合会一个都取不到，
+   * 脚本随之静默退化：测速退回 fetch 被跨域挡掉 → 所有节点判死、
+   * 下载量拿不到、配置也写不进 GM 存储。
+   * 这里先看脚本作用域的裸标识符，取不到再退回 window，两种环境都能用。
+   * ────────────────────────────────────────────────────────── */
+  function gmPick(name, direct) {
+    if (typeof direct === 'function') return direct;
+    try {
+      if (typeof window !== 'undefined' && typeof window[name] === 'function') return window[name];
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  var GM_API = {
+    getValue: gmPick('GM_getValue', typeof GM_getValue === 'function' ? GM_getValue : null),
+    setValue: gmPick('GM_setValue', typeof GM_setValue === 'function' ? GM_setValue : null),
+    xhr: gmPick('GM_xmlhttpRequest', typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null),
+    menu: gmPick('GM_registerMenuCommand',
+      typeof GM_registerMenuCommand === 'function' ? GM_registerMenuCommand : null),
+    addStyle: gmPick('GM_addStyle', typeof GM_addStyle === 'function' ? GM_addStyle : null),
+    clipboard: gmPick('GM_setClipboard', typeof GM_setClipboard === 'function' ? GM_setClipboard : null)
+  };
+
   /* ═══════════════════════════════════════════════════════════
    * 0. 常量与节点表
    * ═══════════════════════════════════════════════════════════ */
@@ -37,7 +67,7 @@
   var KEY_COUNTS = 'gha_counts_v1';
   var HEALTH_TTL = 10 * 60 * 1000;      // 健康数据 10 分钟内复用
   var LIMITED_TTL = 2 * 60 * 1000;      // 被限流（429/403）的节点只冷却 2 分钟，尽快给回机会
-  var PROBE_CONCURRENCY = 4;            // 测速并发：一口气打 20 个节点容易被镜像判成攻击（429）
+  var PROBE_CONCURRENCY = 4;            // 测速并发：一口气把整张表打满容易被镜像判成攻击（429）
   var PROBE_TIMEOUT = 5000;             // 单个节点测速上限：公益镜像 5s 还不响应，基本可以判死
   var PROBE_BYTES = 'bytes=0-2047';     // 只取前 2KB 验证内容，别把 2MB 的 Release 整个拉下来
 
@@ -134,10 +164,6 @@
 
   var memStore = {};
 
-  function hasGM(name) {
-    return typeof window[name] === 'function';
-  }
-
   /** 存档可能是 JSON 字符串（本脚本写入）或已是对象（脚本管理器自动反序列化），损坏时回退默认值 */
   function parseStored(raw, fallback) {
     if (raw === null || raw === undefined) return fallback;
@@ -152,7 +178,7 @@
 
   function getStore(key, fallback) {
     try {
-      if (hasGM('GM_getValue')) return parseStored(window.GM_getValue(key, null), fallback);
+      if (GM_API.getValue) return parseStored(GM_API.getValue(key, null), fallback);
     } catch (e) { /* ignore */ }
     if (Object.prototype.hasOwnProperty.call(memStore, key)) return memStore[key];
     // 没有 GM 存储时 setStore 写的是 localStorage，这里必须对称地读回来，
@@ -167,7 +193,7 @@
   function setStore(key, value) {
     memStore[key] = value;
     try {
-      if (hasGM('GM_setValue')) window.GM_setValue(key, JSON.stringify(value));
+      if (GM_API.setValue) GM_API.setValue(key, JSON.stringify(value));
       else window.localStorage.setItem(key, JSON.stringify(value));
     } catch (e) { /* ignore */ }
   }
@@ -360,8 +386,17 @@
       return 'https://gist.githubusercontent.com/' + m[1] + '/' + m[2] + '/raw/' + m[3];
     }
     if (u.hostname === 'raw.githubusercontent.com' || u.hostname === 'gist.githubusercontent.com') return origin;
-    // blob 页面上的 ?plain=1 对 raw 没有意义，只保留真正需要的查询参数
-    return 'https://raw.githubusercontent.com/' + m[1] + '/' + m[2] + '/' + m[3] + (u.search || '');
+    // blob 页面上的 ?plain=1 对 raw 没有意义，丢掉它，其余查询参数原样保留
+    var search = '';
+    try {
+      var q = new URLSearchParams(u.search || '');
+      q.delete('plain');
+      var qs = q.toString();
+      search = qs ? '?' + qs : '';
+    } catch (e) {
+      search = u.search || '';
+    }
+    return 'https://raw.githubusercontent.com/' + m[1] + '/' + m[2] + '/' + m[3] + search;
   }
 
   /** 按节点风格拼接加速地址；该节点不支持这种 URL 时返回 null */
@@ -393,7 +428,7 @@
 
   var health = getStore(KEY_HEALTH, {}) || {};
 
-  // 早期开发版把健康数据按节点 id 存，第一版起改按「id:路线」存。
+  // 早期开发版把健康数据按节点 id 存，v1.0 起改按「id:路线」存。
   // 旧键一次性清掉：不清的话它们永远不会被读写，只是躺在存储里发霉。
   (function pruneLegacyHealth() {
     if (!health || typeof health !== 'object') { health = {}; return; }
@@ -429,7 +464,7 @@
   /**
    * 统一的轻量请求，优先 GM_xmlhttpRequest（可跨域）。
    * 与旧版相比有三处关键改动：
-   *   1. 带 Range 头只要前 2KB —— 旧版探测 Release 要整包下载 2MB+，20 个节点就是 40MB；
+   *   1. 带 Range 头只要前 2KB —— 旧版探测 Release 要整包下载 2MB+，整张节点表就是 40MB 量级；
    *   2. 校验 Content-Type 与开头字节 —— 不少「假镜像」对所有路径都回 200 的落地页 HTML，
    *      只看状态码会把它们当成可用节点，点下去就是一页广告；
    *   3. 429 / 403 单独标记为「被限流」，健康数据只冷却 2 分钟，不会 10 分钟都躲着它。
@@ -452,9 +487,9 @@
         var ok = status >= 200 && status < 400 && !html && String(text || '').length > 0;
         finish({ ok: ok, status: status, ms: Math.round(nowMs() - t0), limited: limited });
       }
-      if (hasGM('GM_xmlhttpRequest')) {
+      if (GM_API.xhr) {
         try {
-          window.GM_xmlhttpRequest({
+          GM_API.xhr({
             method: 'GET',
             url: url,
             timeout: timeout,
@@ -633,7 +668,7 @@
    * 并发测速全部节点。
    * 用固定大小的并发池而不是 Promise.all 一次性打满：20 个请求同时出去，
    * 不少公益镜像会直接回 429，把「健康」误判成「挂了」。
-   * onProgress(done, total) 可用来驱动面板上的「测速中 3/19」。
+   * onProgress(done, total) 可用来驱动面板上的「测速中 3/19」（分母是当前节点表长度）。
    *
    * 同一时刻只允许一轮测速：启动时的后台测速还没结束时用户又点「重新测速」，
    * 两轮结果会互相覆盖（慢轮次后完成，反而把刚测出的好节点写成超时）。
@@ -831,7 +866,7 @@
     if (styleInjected) return;
     styleInjected = true;
     try {
-      if (hasGM('GM_addStyle')) { window.GM_addStyle(CSS); return; }
+      if (GM_API.addStyle) { GM_API.addStyle(CSS); return; }
     } catch (e) { /* ignore */ }
     var s = document.createElement('style');
     s.textContent = CSS;
@@ -856,7 +891,7 @@
 
   function copyText(text) {
     try {
-      if (hasGM('GM_setClipboard')) { window.GM_setClipboard(text); toast('已复制到剪贴板'); return; }
+      if (GM_API.clipboard) { GM_API.clipboard(text); toast('已复制到剪贴板'); return; }
     } catch (e) { /* ignore */ }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(function () { toast('已复制到剪贴板'); },
@@ -909,6 +944,7 @@
   /**
    * 私有仓库的 Release / raw 都要登录态，公开镜像拿不到（只会 404），
    * 而且也不该把私有链接交给第三方。检测到私有就整体跳过加速，只留面板说明。
+   * secret gist 同理：它的 URL 本身就是访问凭据，交给镜像等于把内容转给镜像方。
    *
    * 这个函数会被 MutationObserver 每批变更调到（GitHub 的 DOM 变更非常频繁），
    * 所以按 href 缓存结果：同一页面内的可见性不会变，换页时 href 变了自然失效。
@@ -925,6 +961,16 @@
       else {
         var vis = document.querySelector('[data-testid="repository-visibility"]');
         if (vis && /^(private|internal|私有|内部)$/i.test((vis.textContent || '').trim())) out = true;
+      }
+      // secret gist：GitHub 没有长期稳定的公开标记，只能尽力识别（官方 meta 优先，其次页面徽标）。
+      // 识别不到就退回原行为，宁可漏判也不误伤公开 gist。
+      if (!out && location.hostname === 'gist.github.com') {
+        var gmeta = document.querySelector('meta[name="octolytics-dimension-gist_secret"]');
+        if (gmeta) out = String(gmeta.getAttribute('content') || '').toLowerCase() === 'true';
+        if (!out) {
+          var badge = document.querySelector('.gist-secret-label, [data-testid="gist-visibility"]');
+          if (badge && /^(secret|私有)$/i.test((badge.textContent || '').trim())) out = true;
+        }
       }
     } catch (e) { /* ignore */ }
     privCacheHref = location.href;
@@ -1059,7 +1105,8 @@
       var acc = buildAccel(toRawUrl(best.href.split('#')[0].split('?')[0]), 'raw');
       if (!acc) continue;
       var name = (best.textContent || 'file').trim();
-      var dl = makeChip(acc, '☁', '通过镜像直接下载 ' + name + '\n' + acc);
+      // 跨域时 download 属性会被浏览器忽略，实际行为是新标签页打开，文案按真实行为写
+      var dl = makeChip(acc, '☁', '通过镜像下载 ' + name + '（新标签页打开）\n' + acc);
       dl.className = 'gha-dl';
       dl.setAttribute('download', name);
       dl.setAttribute('data-gha-chip', '1');
@@ -1262,6 +1309,11 @@
     arch: 4500, linux: 4000, android: 3500, ios: 3000, other: 2000, meta: -1000, source: -2000
   };
 
+  // Linux 专属的包格式分组：os=linux 时它们也算「当前系统」。
+  // 少了这一条，.deb 的基准分（7000）低于通用 tarball（10000），
+  // 「推荐」徽章会标到 tarball 上，与「优先原生包管理器格式」的意图相反。
+  var LINUX_GROUPS = { deb: 1, rpm: 1, appimage: 1, flatpak: 1, arch: 1 };
+
   // 非所选架构时的兜底偏好分（所选架构 +500，通用包 +60）
   var ARCH_SCORE = { universal: 60, x86_64: 50, arm64: 20, x86: 10, arm32: 5 };
 
@@ -1342,7 +1394,7 @@
     score: function (name, os, arch, group) {
       var n = String(name).toLowerCase();
       var score;
-      var isCurrent = group === os || group.indexOf(os + '-') === 0;
+      var isCurrent = group === os || (os === 'linux' && LINUX_GROUPS[group] === 1);
       if (isCurrent) {
         score = 10000;
         // 同为当前系统时，优先原生包管理器格式（安装体验最好）
@@ -1553,12 +1605,12 @@
 
   function fetchCounts(tag) {
     return new Promise(function (resolve, reject) {
-      if (!hasGM('GM_xmlhttpRequest')) { reject(new Error('无跨域能力')); return; }
+      if (!GM_API.xhr) { reject(new Error('无跨域能力')); return; }
       var ctx = pageContext();
       if (!ctx.owner || !ctx.repo) { reject(new Error('无仓库上下文')); return; }
       var url = 'https://api.github.com/repos/' + ctx.owner + '/' + ctx.repo
         + '/releases/tags/' + encodeURIComponent(tag);
-      window.GM_xmlhttpRequest({
+      GM_API.xhr({
         method: 'GET',
         url: url,
         timeout: 10000,
@@ -2211,11 +2263,11 @@
     }
 
     // 菜单命令
-    if (hasGM('GM_registerMenuCommand')) {
-      window.GM_registerMenuCommand('⚡ 打开 / 收起面板', function () {
+    if (GM_API.menu) {
+      GM_API.menu('⚡ 打开 / 收起面板', function () {
         togglePanel(!panelEl || panelEl.hidden);
       });
-      window.GM_registerMenuCommand('🔁 重新测速全部节点', function () {
+      GM_API.menu('🔁 重新测速全部节点', function () {
         probeAll().then(function () {
           resetDecorations();
           decorateAll();
@@ -2224,10 +2276,10 @@
         });
       });
       // 菜单项文案注册后不会跟着状态变，所以写成中性的「切换」，避免关掉后还显示「关闭加速」
-      window.GM_registerMenuCommand('⏯ 切换加速开关', function () {
+      GM_API.menu('⏯ 切换加速开关', function () {
         applyEnabled(!cfg.enabled);
       });
-      window.GM_registerMenuCommand('🔗 自定义镜像地址', function () {
+      GM_API.menu('🔗 自定义镜像地址', function () {
         var cur = cfg.custom || '';
         var input = window.prompt(
           '输入自定义镜像前缀（留空 = 清除）：\n'
@@ -2241,7 +2293,7 @@
         paneReset();
         probeAll().then(function () { resetDecorations(); decorateAll(); renderPanel(); toast('已应用自定义节点'); });
       });
-      window.GM_registerMenuCommand('♻️ 恢复默认设置', function () {
+      GM_API.menu('♻️ 恢复默认设置', function () {
         if (typeof window.confirm === 'function' && !window.confirm('把所有设置恢复默认（包括自定义镜像与系统选择）？')) return;
         for (var k in DEFAULT_CFG) {
           if (Object.prototype.hasOwnProperty.call(DEFAULT_CFG, k)) cfg[k] = DEFAULT_CFG[k];
