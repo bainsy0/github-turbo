@@ -2,14 +2,14 @@
 // @name         GitHub 高速通道 · GitHub Turbo
 // @name:zh-CN   GitHub 高速通道
 // @namespace    https://github.com/Bainsy0/github-turbo
-// @version      1.0.1
-// @description  给 GitHub 页面加一条高速通道：19 个镜像节点自动测速择优、失败自动降级，Releases / 源码包 / Raw / Gist / 头像一键加速；Release 附件按你的系统与架构排序并标出推荐、显示下载量、精确时间、折叠更新日志；raw 页面另有一键镜像下载工具条。
+// @version      1.1.1
+// @description  给 GitHub 页面加一条高速通道：19 个镜像节点自动测速择优、失败自动复活、点击逐节点故障转移、永不断链兜底，Releases / 源码包 / Raw / Gist / 头像一键加速；无 GM_xmlhttpRequest 时用图片探测免 CORS 测速；内置镜像站打开本页 / 复制 hosts 逃生入口；Release 附件按系统与架构排序标出推荐、显示下载量、精确时间、折叠更新日志；raw 页面另有一键镜像下载工具条。
 // @author       Bainsy0
 // @license      MIT
 // @homepageURL  https://github.com/Bainsy0/github-turbo
 // @supportURL   https://github.com/Bainsy0/github-turbo/issues
-// @updateURL    https://raw.githubusercontent.com/Bainsy0/github-turbo/main/github-turbo.js
-// @downloadURL  https://raw.githubusercontent.com/Bainsy0/github-turbo/main/github-turbo.js
+// @updateURL    https://cdn.gh-proxy.org/https://raw.githubusercontent.com/Bainsy0/github-turbo/main/github-turbo.js
+// @downloadURL  https://cdn.gh-proxy.org/https://raw.githubusercontent.com/Bainsy0/github-turbo/main/github-turbo.js
 // @match        https://github.com/*
 // @match        https://gist.github.com/*
 // @match        https://raw.githubusercontent.com/*
@@ -65,11 +65,45 @@
   var KEY_CFG = 'gha_cfg_v1';
   var KEY_HEALTH = 'gha_health_v1';
   var KEY_COUNTS = 'gha_counts_v1';
-  var HEALTH_TTL = 10 * 60 * 1000;      // 健康数据 10 分钟内复用
+  var HEALTH_TTL = 10 * 60 * 1000;      // 成功的健康数据 10 分钟内复用
   var LIMITED_TTL = 2 * 60 * 1000;      // 被限流（429/403）的节点只冷却 2 分钟，尽快给回机会
+  var FAIL_TTL = 60 * 1000;             // 失败记录只冷却 1 分钟，网络一恢复就让它复活（v1.1.0）
   var PROBE_CONCURRENCY = 4;            // 测速并发：一口气把整张表打满容易被镜像判成攻击（429）
   var PROBE_TIMEOUT = 5000;             // 单个节点测速上限：公益镜像 5s 还不响应，基本可以判死
   var PROBE_BYTES = 'bytes=0-2047';     // 只取前 2KB 验证内容，别把 2MB 的 Release 整个拉下来
+
+  // v1.1.0：无 GM_xmlhttpRequest 时用 <img> 探测。加载跨域图片不需要 CORS 读权限，
+  // 也不需要任何 @grant，因此即便脚本管理器把 GM_xhr 挡掉，也不会「全节点判死 → 只能直连」。
+  // 参考 github.akams.cn / greasyfork-zh 的 Image 延迟探测；?t= 防缓存，onerror/超时判死。
+  //
+  // v1.1.1：探测图改为「小 PNG + 多源回退」。旧值指向 raw.githubusercontent.com 的
+  // code.ico（90KB），实测 17 个节点里有 2 个直接失败、最快的也要 1s；而 raws 本身
+  // 在国内就是被 RESET 的域名，用它当「所有节点是否活着」的标尺等于拿最不可靠的
+  // 那条路径量别人。换成 9KB 的 png，实测 17/17 全通（ghproxy.net 从 TIMEOUT 变 200），
+  // 延迟也普遍降一半。仍保留多源，某个源失效时 onerror 逐个回退。
+  var PROBE_IMGS = [
+    'https://raw.githubusercontent.com/github/explore/main/topics/python/python.png',
+    'https://raw.githubusercontent.com/microsoft/vscode/main/resources/win32/code.ico'
+  ];
+  var PROBE_IMG = PROBE_IMGS[0];        // 兼容旧引用
+  var PROBE_MAX_BYTES = 4096;           // fetch 探测只读前 4KB，避免整包下载
+  var FAILOVER_TRIES = 3;               // 点击时最多并行验证 3 个候选节点
+  var FAILOVER_TIMEOUT = 2500;          // 点击故障转移的单节点验证上限（比全表测速更短，别让用户干等）
+  var WATCHDOG_MIN = 30 * 1000;         // 「零可用节点」时自动重测的起始间隔
+  var WATCHDOG_MAX = 5 * 60 * 1000;     // 退避上限
+
+  // 逃生入口：连不上 github.com 主站时用。HTML 反向代理（不是文件下载镜像，
+  // gh-proxy 系对 github.com HTML 只会返回落地页），需国内 IP、不能登录/上传。
+  var ESCAPE_HOSTS = [
+    { label: 'KGitHub 打开本页', host: 'kkgithub.com' },
+    { label: 'bgithub 打开本页', host: 'bgithub.xyz' }
+  ];
+  // 免访问 GitHub 即可取到的 hosts（GitHub520）。gitcdn.top 带 CORS 头，
+  // raw.hellogithub.com 无 CORS 头（只能靠 GM_xhr 取）。两者 IP 来源独立，不可混用。
+  var HOSTS_SOURCES = [
+    'https://hosts.gitcdn.top/hosts.txt',
+    'https://raw.hellogithub.com/hosts'
+  ];
 
   var PROBE_TARGETS = {
     raw: 'https://raw.githubusercontent.com/git/git/master/README.md',
@@ -134,8 +168,13 @@
       style: 'jsdelivr', caps: CAP.raw, tier: 2
     },
     {
-      id: 'jsdelivr-fastly', label: 'JSDelivr', base: 'https://fastly.jsdelivr.net',
-      style: 'jsdelivr', caps: CAP.raw, tier: 2
+      // v1.1.0：原 fastly.jsdelivr.net 实测 301 跳回被墙的 raw 域名（连
+      // 正确 /gh/ 路径也跳），确认死链；换成实测 raw/archive/release/gist
+      // 四路线全 206 的 gh.catmak.name。改成 full 风格但只标 CAP.core，
+      // 因为未验证 avatar 路线。保持数组长度 19，避免 README 表格与
+      // scripts/check.js 的节点计数失配。
+      id: 'catmak', label: 'catmak', base: 'https://gh.catmak.name',
+      style: 'full', caps: CAP.core
     }
   ];
 
@@ -468,6 +507,13 @@
    *   2. 校验 Content-Type 与开头字节 —— 不少「假镜像」对所有路径都回 200 的落地页 HTML，
    *      只看状态码会把它们当成可用节点，点下去就是一页广告；
    *   3. 429 / 403 单独标记为「被限流」，健康数据只冷却 2 分钟，不会 10 分钟都躲着它。
+   *
+   * v1.1.1：把「探测通道自己坏了」与「节点真的挂了」分开。
+   * 旧版 onerror / onabort 一律记 status:0 + ok:false，于是 ScriptCat 下 GM_xhr
+   * 通道出现问题时，整张节点表会在同一轮被判死（实测健康数据里 61 条只剩 3 条
+   * ok，而此时同一节点用 fetch 打是 200/700ms）。status:0 因此改记为
+   * ok:false + transport:true：它仍然不参与择优，但和「对端拒绝/超时」区分开，
+   * 面板能看到真实原因（详见 renderPanel 的 msText 分支）。
    */
   function probe(url, timeout) {
     timeout = timeout || 6000;
@@ -487,6 +533,21 @@
         var ok = status >= 200 && status < 400 && !html && String(text || '').length > 0;
         finish({ ok: ok, status: status, ms: Math.round(nowMs() - t0), limited: limited });
       }
+      // 通道级失败：请求根本没拿到响应（不是对端拒绝）。
+      // v1.1.1：先尝试 fetch 复核一次 —— 若 fetch 能拿到，说明是 GM_xhr 通道
+      // （ScriptCat MV3 下常见）自己坏了，此时必须判「活」，否则整张表被误杀。
+      function channelFail(ms) {
+        if (triedFallback) {
+          finish({ ok: false, status: 0, ms: ms, limited: false, transport: true });
+          return;
+        }
+        triedFallback = true;
+        probeViaFetch(url, timeout).then(function (res) {
+          if (res && res.ok) { res.viaFetch = true; finish(res); return; }
+          finish({ ok: false, status: 0, ms: Math.round(nowMs() - t0), limited: false, transport: true });
+        });
+      }
+      var triedFallback = false;
       if (GM_API.xhr) {
         try {
           GM_API.xhr({
@@ -496,44 +557,177 @@
             anonymous: true,                 // 不把本机 Cookie 发给第三方镜像
             headers: { Range: PROBE_BYTES },
             onload: function (r) {
+              // 拿到了响应但状态码是 0（ScriptCat 偶发）也算通道失败
+              if (!r || !r.status) { channelFail(Math.round(nowMs() - t0)); return; }
               evaluate(r.status, r.responseHeaders, r.responseText);
             },
-            onerror: function () { finish({ ok: false, status: 0, ms: Math.round(nowMs() - t0) }); },
+            onerror: function () { channelFail(Math.round(nowMs() - t0)); },
             ontimeout: function () { finish({ ok: false, status: 0, ms: timeout }); },
-            onabort: function () { finish({ ok: false, status: 0, ms: Math.round(nowMs() - t0) }); }
+            onabort: function () { channelFail(Math.round(nowMs() - t0)); }
           });
         } catch (e) {
-          finish({ ok: false, status: -1, ms: 0 });
+          channelFail(0);
         }
         return;
       }
-      // 降级：fetch（要求镜像允许 CORS，通常用于测试环境）
+      probeViaFetch(url, timeout).then(finish);
+    });
+  }
+
+  /**
+   * v1.1.1：纯 fetch 探测（GM_xhr 不可用、或 GM_xhr 通道失败时的复核通道）。
+   * 刻意不带 Range：实测 wget.la / gh.idayer.com / gh.catmak.name 对
+   * 「Range + 跨域」直接回 402/403，一次预检失败就把节点判死。
+   * 探测只需要「能取到前几 KB」，用 PROBE_MAX_BYTES 截断即可。
+   */
+  function probeViaFetch(url, timeout) {
+    timeout = timeout || 6000;
+    var t0 = nowMs();
+    return new Promise(function (resolve) {
+      if (typeof fetch !== 'function') {
+        resolve({ ok: false, status: 0, ms: 0, limited: false, transport: true });
+        return;
+      }
       var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
       var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, timeout);
+      function done(res) { clearTimeout(timer); resolve(res); }
       fetch(url, {
         signal: ctrl ? ctrl.signal : undefined,
         mode: 'cors',
-        cache: 'no-store',
-        headers: { Range: PROBE_BYTES }
+        cache: 'no-store'
       })
         .then(function (r) {
           return r.text().then(function (text) {
-            clearTimeout(timer);
-            var headers = {};
-            try { r.headers.forEach(function (v, k) { headers[k] = v; }); } catch (e) { /* ignore */ }
-            evaluate(r.status, headers, text.slice(0, 4096));
+            var ct = '';
+            try { ct = r.headers.get('content-type') || ''; } catch (e) { /* ignore */ }
+            var body = String(text || '').slice(0, PROBE_MAX_BYTES);
+            var limited = r.status === 429 || r.status === 403;
+            var html = /text\/html/i.test(ct) || /^\s*(<!doctype html|<html)/i.test(body.slice(0, 300));
+            var ok = r.status >= 200 && r.status < 400 && !html && body.length > 0;
+            done({ ok: ok, status: r.status, ms: Math.round(nowMs() - t0), limited: limited });
           });
         })
         .catch(function () {
-          clearTimeout(timer);
-          finish({ ok: false, status: 0, ms: Math.round(nowMs() - t0) });
+          done({ ok: false, status: 0, ms: Math.round(nowMs() - t0), limited: false, transport: true });
         });
     });
   }
 
-  /** 失败/限流结果的有效期：限流只记 2 分钟，真挂了记 10 分钟 */
+  /**
+   * v1.1.0：用 <img> 探测节点可达性，完全绕开 CORS / @grant。
+   * 加载一张跨域图片不要求服务器给出 Access-Control-Allow-Origin，也不需要
+   * GM_xmlhttpRequest；只要 onload 触发就说明「这个镜像能把 GitHub 资源送到浏览器」。
+   * ?t= 防缓存；onerror 或超时判死。参考 github.akams.cn 的延迟探测实现。
+   * 局限：只能判断可达，拿不到 Content-Type / 状态码，所以是 GM_xhr 不可用时的
+   * 次优探测手段（仍优于「被 CORS 挡掉 → 全部判死」）。
+   * v1.1.1：同样不再固定单张探测图，由调用方 probeNodeViaImage 逐个回退。
+   */
+  function probeViaImage(url, timeout) {
+    timeout = timeout || PROBE_TIMEOUT;
+    return new Promise(function (resolve) {
+      var t0 = nowMs();
+      var settled = false;
+      var img = null;
+      function finish(ok) {
+        if (settled) return;
+        settled = true;
+        if (img) { img.onload = img.onerror = null; }
+        resolve({ ok: !!ok, status: ok ? 200 : 0, ms: Math.round(nowMs() - t0), limited: false });
+      }
+      try {
+        img = new Image();
+        img.onload = function () { finish(true); };
+        img.onerror = function () { finish(false); };
+        var sep = url.indexOf('?') >= 0 ? '&' : '?';
+        img.src = url + sep + 't=' + Date.now();
+        setTimeout(function () { finish(false); }, timeout);
+      } catch (e) {
+        finish(false);
+      }
+    });
+  }
+
+  /**
+   * v1.1.0 探测能力闸门：有 GM_xmlhttpRequest 用带 Range + 内容校验的强探测；
+   * 没有则退回 Image 探测（免 CORS）。无论哪种，都保证「能测」，
+   * 不会因为没有 GM_xhr 而把整张节点表判死、导致所有加速链接消失。
+   *
+   * v1.1.1：
+   *  - GM_xhr 的探测目标换成「节点 + 路线自身 URL」，不再固定 PROBE_IMG；
+   *  - Image 分支按 PROBE_IMGS 逐个试，第一张加载成功即算该节点可达。
+   */
+  function probeNode(m, route, timeout) {
+    var t = timeout || PROBE_TIMEOUT;
+    if (GM_API.xhr) return probe(joinMirrorUrl(m, route.url), t);
+    return probeNodeViaImage(m, t);
+  }
+
+  /** Image 分支：对本节点逐个试 PROBE_IMGS，任一成功即判活 */
+  function probeNodeViaImage(m, timeout) {
+    var i = 0;
+    var t0 = nowMs();
+    function tryNext() {
+      if (i >= PROBE_IMGS.length) {
+        return Promise.resolve({ ok: false, status: 0, ms: Math.round(nowMs() - t0), limited: false });
+      }
+      var imgUrl = joinMirrorUrl(m, PROBE_IMGS[i++]);
+      if (!imgUrl) return tryNext();
+      return probeViaImage(imgUrl, timeout).then(function (res) {
+        if (res.ok) return res;
+        return tryNext();
+      });
+    }
+    return tryNext();
+  }
+
+  /**
+   * v1.1.0：取一段纯文本（hosts 内容）。GM_xhr 优先（可跨域，无需 CORS），
+   * 否则 fetch（要求对端有 ACAO 头）。用于「复制 GitHub hosts」逃生入口。
+   */
+  function fetchText(url, timeout) {
+    timeout = timeout || 6000;
+    if (GM_API.xhr) {
+      return new Promise(function (resolve) {
+        var done = false;
+        function finish(text) { if (!done) { done = true; resolve(text || ''); } }
+        try {
+          GM_API.xhr({
+            method: 'GET', url: url, timeout: timeout, anonymous: true,
+            onload: function (r) {
+              var text = String(r.responseText || '');
+              finish(r.status >= 200 && r.status < 400 ? text : '');
+            },
+            onerror: function () { finish(''); },
+            ontimeout: function () { finish(''); },
+            onabort: function () { finish(''); }
+          });
+        } catch (e) { finish(''); }
+      });
+    }
+    var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, timeout);
+    return fetch(url, { signal: ctrl ? ctrl.signal : undefined, cache: 'no-store' })
+      .then(function (r) {
+        clearTimeout(timer);
+        if (!(r.status >= 200 && r.status < 400)) return '';
+        return r.text();
+      })
+      .catch(function () { clearTimeout(timer); return ''; });
+  }
+
+  /**
+   * 记录的有效期。v1.1.0 把「失败」和「成功」分开：
+   *   成功  → HEALTH_TTL（10 分钟复用，没必要反复打公益镜像）
+   *   限流  → LIMITED_TTL（2 分钟，给回机会）
+   *   失败  → FAIL_TTL（1 分钟）。旧版失败也记 10 分钟，一旦某轮全网抖动，
+   *   整整 10 分钟里所有加速链接都消失，只能直连 —— 这正是「有时连不上」的
+   *   放大环节。缩短到 1 分钟后，网络恢复即自动回到未知梯队重新参与择优。
+   */
   function freshTtl(h) {
-    return h && h.limited ? LIMITED_TTL : HEALTH_TTL;
+    if (!h) return HEALTH_TTL;
+    if (h.limited) return LIMITED_TTL;
+    if (h.ok === false) return FAIL_TTL;
+    return HEALTH_TTL;
   }
 
   function isFresh(h) {
@@ -599,7 +793,13 @@
    *   1. 该路线实测通过 —— 按 tier、再按延迟升序；
    *   2. 该路线没数据、但节点在别的路线验证活着 —— 不是死站，只是这条没实测；
    *   3. 从没测过 / 结果已过期 —— 按静态顺序兜底。
-   * 明确挂掉的直接排除，这样 buildAccel 会返回 null，调用方才能回退直连。
+   * 明确挂掉的直接排除。
+   *
+   * v1.1.0 新增「永不断链兜底」：若三档都为空（例如整轮探测恰好赶上全网
+   * 抖动、或所有失败记录仍是新鲜的），不再返回空让 buildAccel 回退直连，
+   * 而是退回静态优先级里第一个「没有新鲜限流记录」的节点。宁可给一条
+   * 未经验证的镜像链接，也不要让按钮变成直连 —— 这正是用户反馈的
+   * 「有时连不上 GitHub」在脚本侧最致命的表现。
    */
   function pickCandidates(cap, limit) {
     var need = cap || 'raw';
@@ -613,7 +813,7 @@
       }
     }
 
-    var good = [], mid = [], unknown = [];
+    var good = [], mid = [], unknown = [], failed = [];
     for (var j = 0; j < list.length; j++) {
       var m = list[j];
       if (!supports(m, need)) continue;
@@ -622,7 +822,15 @@
       // 失败结果同样受 TTL 约束：只在「刚测出来是死的」这段时间里排除，
       // 过期后重新回到未知梯队再给一次机会。否则节点一旦失败就永久出局，
       // 只能等用户手动「重新测速」，等于静默失效。
-      if (st && st.ok === false && isFresh(st)) continue;
+      //
+      // v1.1.1：transport 失败（status:0，请求没拿到响应）不算「节点死了」，
+      // 只降级到 unknown 梯队。旧版不区分，GM_xhr 通道整体失灵时会把 19 个
+      // 节点一起剔出候选，加速按钮全部消失 —— 这是「装了跟没装一样」的主因。
+      if (st && st.ok === false && isFresh(st)) {
+        if (st.transport) { unknown.push(m); continue; }
+        failed.push(m);
+        continue;
+      }
       var alt = freshOkOf(m);
       if (alt) mid.push({ m: m, ms: alt.ms });
       else unknown.push(m);                       // 从没测过 / 结果已过期 → 第三梯队
@@ -634,6 +842,21 @@
     good.sort(byTierThenMs);
     mid.sort(byTierThenMs);
     var out = good.concat(mid).map(function (x) { return x.m; }).concat(unknown);
+    // v1.1.1：兜底条件从 out.length===0 改为「没有任何经过验证的节点」。
+    // 旧条件几乎永不成立（unknown 梯队几乎总有元素），导致注释承诺的
+    // 「宁可给一条未验证镜像」实际不触发，表现为按钮直接消失。
+    if (!good.length && !mid.length) {
+      // 兜底：只排除「新鲜限流」的节点（被限流的确实不该再派活），其余按静态顺序给。
+      // 已判死的节点排在最后，但仍保留 —— 比让用户看不到任何入口强。
+      for (var f = 0; f < list.length; f++) {
+        var fm = list[f];
+        if (!supports(fm, need)) continue;
+        if (out.indexOf(fm) >= 0) continue;
+        var fs = hOf(fm, need);
+        if (fs && fs.limited && isFresh(fs)) continue;
+        out.push(fm);
+      }
+    }
     return out.slice(0, limit || 1);
   }
 
@@ -695,11 +918,6 @@
         launch();
       }
 
-      /** 统一写一条「节点 + 路线」的健康记录 */
-      function record(m, cap, rec) {
-        health[hKey(m, cap)] = rec;
-      }
-
       function launch() {
         if (cursor >= list.length) return;
         var m = list[cursor++];
@@ -711,7 +929,8 @@
           tick();
           return;
         }
-        probe(joinMirrorUrl(m, route.url), PROBE_TIMEOUT).then(function (r) {
+        // v1.1.0：改用探测能力闸门（有 GM_xhr 走强探测 / 无则走免 CORS 的 Image 探测）。
+        probeNode(m, route, PROBE_TIMEOUT).then(function (r) {
           record(m, route.cap, {
             ok: r.ok,
             ms: r.ms,
@@ -719,15 +938,16 @@
             limited: !!r.limited,
             ts: t0
           });
-          // 探活失败且不是限流（域名没了 / 连不上）属于整站级故障，同步给它声称支持的
-          // 所有路线，免得用户被派到一条必然死的链接上。
-          // 429/403 只代表被限的那条路线暂时不给，不扩散到其他路线。
-          if (!r.ok && !r.limited) {
-            for (var c1 in m.caps) {
-              if (c1 === route.cap) continue;
-              record(m, c1, { ok: false, ms: r.ms, status: r.status, limited: false, ts: t0 });
-            }
-          }
+          // v1.1.0：删掉了「单路线失败扩散到该节点所有 caps」的逻辑。
+          // 2026-11 实测同一节点 raw 挂、archive/release 却 206 可用是常态，
+          // 旧逻辑会把整站误杀 10 分钟（配合旧的 10 分钟失败 TTL 更是雪上加霜）。
+          // 现在每条路线独立记账，失败只冷却 1 分钟，由看门狗自动重测复活。
+          finished++;
+          tick();
+        }, function () {
+          // 探测实现本身抛错（自定义脚本管理器实现不合规等）时也要记账并推进，
+          // 否则 finished 永远追不上 list.length，probeInFlight 卡死、看门狗再也动不了。
+          record(m, route.cap, { ok: false, ms: 0, status: 0, limited: false, ts: t0 });
           finished++;
           tick();
         });
@@ -746,6 +966,57 @@
     });
 
     return probeInFlight;
+  }
+
+  /** 当前是否存在「任一节点、任一路线」新鲜成功记录 */
+  function hasAnyVerified() {
+    var list = mirrorList();
+    for (var i = 0; i < list.length; i++) {
+      if (freshOkOf(list[i])) return true;
+    }
+    return false;
+  }
+
+  /**
+   * v1.1.0 自动复活看门狗。
+   * 旧版只在 boot（有 stale）或用户手动点「重新测速」时重探；一旦某轮全网
+   * 抖动把节点全判死，之后网络恢复了也不会自己回来，只能一直直连。
+   * 这里带退避地周期性检查：只要「一个已验证节点都没有」，就自动重测；
+   * 恢复后回到 30s 间隔，持续失败则翻倍到 5 分钟封顶，避免疯狂打公益镜像。
+   * 由 boot() 启动一次，页面生命周期内常驻。
+   */
+  var watchdogDelay = WATCHDOG_MIN;
+  var watchdogTimer = null;
+
+  function scheduleWatchdog(delay) {
+    if (watchdogTimer) clearTimeout(watchdogTimer);
+    watchdogTimer = setTimeout(watchdogTick, delay);
+  }
+
+  function watchdogTick() {
+    watchdogTimer = null;
+    try {
+      if (accelReady() && !probeInFlight && !hasAnyVerified()) {
+        probeAll().then(function () {
+          try {
+            renderPanel();
+            resetDecorations();
+            decorateAll();
+          } catch (e) { /* ignore */ }
+          // 这轮仍没探活 → 退避；探活了 → 回到最短间隔
+          watchdogDelay = hasAnyVerified()
+            ? WATCHDOG_MIN
+            : Math.min(WATCHDOG_MAX, watchdogDelay * 2);
+        });
+      } else {
+        watchdogDelay = WATCHDOG_MIN;
+      }
+    } catch (e) { /* ignore */ }
+    scheduleWatchdog(watchdogDelay);
+  }
+
+  function startWatchdog() {
+    scheduleWatchdog(WATCHDOG_MIN);
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -1987,9 +2258,12 @@
       var row = document.createElement('div');
       row.className = 'gha-item' + (cfg.mirror === m.id ? ' gha-on' : '');
       // 限流（429/403）用黄点而不是红点：节点可能只是临时拒绝，和「域名挂了」不是一回事
-      var cls = h.ok === true ? 'ok' : (h.ok === false ? (h.limited ? 'wait' : 'dead') : 'wait');
+      // v1.1.1：transport 失败（请求没发出去 / 拿不到响应）也用黄点标「探测失败」，
+      // 不再显示成「—」，否则用户无法区分「节点挂了」和「脚本自己的通道挂了」
+      var cls = h.ok === true ? 'ok'
+        : (h.ok === false ? (h.limited || h.transport ? 'wait' : 'dead') : 'wait');
       var msText = h.ok && typeof h.ms === 'number' ? h.ms + 'ms'
-        : (h.limited ? '限流' : (h.status ? 'HTTP ' + h.status : '—'));
+        : (h.limited ? '限流' : (h.transport ? '探测失败' : (h.status ? 'HTTP ' + h.status : '—')));
       row.innerHTML = '<span class="gha-dot ' + cls + '"></span>'
         + '<span class="gha-grow"><b>' + m.label + '</b></span>'
         + '<span style="opacity:.6">' + msText + '</span>'
@@ -2013,6 +2287,7 @@
           copyText('git clone ssh://git@ssh.github.com:443/' + ctx.owner + '/' + ctx.repo + '.git');
         });
       }
+      addEscapeActions(actions);
       return;
     }
     if (ctx.owner && ctx.repo) {
@@ -2049,6 +2324,7 @@
         else toast('暂无可用节点');
       });
     }
+    addEscapeActions(actions);
   }
 
   /**
@@ -2069,6 +2345,20 @@
     b.textContent = label;
     b.addEventListener('click', fn);
     root.appendChild(b);
+  }
+
+  /**
+   * v1.1.0 逃生入口按钮组。故意放在「私有仓库」分支之外共用的位置：
+   * 私有仓库恰恰是完全不能走镜像的场景，此时用户更需要「换条路进 GitHub」。
+   * 已经在镜像站上就不再显示「打开本页」（套一层没意义）。
+   */
+  function addEscapeActions(root) {
+    if (!onMirrorHost()) {
+      ESCAPE_HOSTS.forEach(function (item) {
+        addAction(root, item.label, function () { openEscape(item); });
+      });
+    }
+    addAction(root, '复制 hosts', copyHosts);
   }
 
   /** git clone 只能走「前缀式」节点，且要支持仓库归档 */
@@ -2096,6 +2386,106 @@
     if (!acc) { toast('暂无可用节点，已使用直连'); window.open(url, '_blank', 'noopener'); return; }
     toast('走 ' + m.label + ' 下载');
     window.open(acc, '_blank', 'noopener');
+  }
+
+  /* ──────────────────────────────────────────────────────────
+   * v1.1.0 逃生入口：连不上 github.com 主站时用
+   * ────────────────────────────────────────────────────────── */
+
+  /** 把当前页面换到 HTML 反向代理上打开（不是文件镜像，gh-proxy 系做不了 HTML） */
+  function openEscape(item) {
+    var host = item && item.host;
+    if (!host) return;
+    var target = 'https://' + host + location.pathname + location.search + location.hash;
+    window.open(target, '_blank', 'noopener');
+    toast('已用 ' + host + ' 打开本页（需国内 IP，不能登录 / 上传）');
+  }
+
+  /** 当前页面是否已经在某个镜像站上（在镜像站上就别再套一层） */
+  function onMirrorHost() {
+    var h = String(location.hostname || '');
+    for (var i = 0; i < ESCAPE_HOSTS.length; i++) {
+      if (h === ESCAPE_HOSTS[i].host) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 复制 GitHub520 hosts 到剪贴板。
+   * 按 HOSTS_SOURCES 顺序试：gitcdn.top 带 ACAO（无 GM_xhr 也能 fetch），
+   * raw.hellogithub.com 没有 ACAO（只能靠 GM_xhr）。取到后必须校验
+   * 「不是 HTML 落地页」且「确实含 github.com」，否则会把一页导航骨架塞进 hosts。
+   */
+  function copyHosts() {
+    function attempt(idx) {
+      if (idx >= HOSTS_SOURCES.length) {
+        toast('hosts 源暂时取不到（可能都被墙），请稍后再试');
+        return;
+      }
+      toast('正在获取 hosts…');
+      fetchText(HOSTS_SOURCES[idx], 8000).then(function (text) {
+        var body = String(text || '');
+        // 落地页 / 错误页识别：真 hosts 以 # 注释或 IP 开头，绝不会是 <!doctype
+        var isHtml = /^\s*<(?:!doctype|html|head|body)/i.test(body);
+        if (!body || isHtml || body.indexOf('github.com') < 0) { attempt(idx + 1); return; }
+        copyText(body);
+        toast('已复制 GitHub520 hosts 共 ' + body.split('\n').length
+          + ' 行：粘贴到系统 hosts 即可（只治 DNS 污染 / 图裂，治不了 SNI 封锁；HelloGitHub 端点 2026-12-31 有到期风险）');
+      });
+    }
+    attempt(0);
+  }
+
+  /**
+   * v1.1.0 点击故障转移：对候选节点并行验证，用第一个通过的。
+   * 没有 GM_xhr 时不验证（Image 探测只能证明「图片能加载」，不足以证明
+   * 这条下载链接可用），直接打开手头这条加速链接 —— 仍好于回退直连。
+   * 验证结果写回 health，让面板与后续选择跟着变好。
+   */
+  function openWithFailover(origin, need, fallbackHref) {
+    var cands = pickCandidates(need, FAILOVER_TRIES);
+    if (!cands.length) {
+      if (fallbackHref) { window.open(fallbackHref, '_blank', 'noopener'); return; }
+      window.open(origin, '_blank', 'noopener');
+      return;
+    }
+    if (!GM_API.xhr || cands.length === 1) {
+      var only = buildAccelWith(origin, need, cands[0]) || fallbackHref || origin;
+      window.open(only, '_blank', 'noopener');
+      return;
+    }
+    var settled = false;
+    var pending = cands.length;
+    toast('正在挑选可用节点…');
+    cands.forEach(function (m) {
+      var url = buildAccelWith(origin, need, m);
+      if (!url) { if (--pending === 0 && !settled) flushFallback(); return; }
+      probe(url, FAILOVER_TIMEOUT).then(function (r) {
+        record(m, need, { ok: r.ok, ms: r.ms, status: r.status, limited: !!r.limited, ts: Date.now() });
+        if (settled) return;
+        if (r.ok) {
+          settled = true;
+          window.open(url, '_blank', 'noopener');
+          toast('走 ' + m.label + ' 下载');
+          return;
+        }
+        if (--pending === 0) flushFallback();
+      }).catch(function () {
+        if (--pending === 0 && !settled) flushFallback();
+      });
+    });
+    function flushFallback() {
+      if (settled) return;
+      settled = true;
+      var href = fallbackHref || buildAccel(origin, need) || origin;
+      window.open(href, '_blank', 'noopener');
+      toast('节点都不稳定，已用备用链接打开');
+    }
+  }
+
+  /** 写一条健康记录（故障转移与测速共用，只改内存，持久化由调用方负责） */
+  function record(m, cap, rec) {
+    health[hKey(m, cap)] = rec;
   }
 
   function togglePanel(show) {
@@ -2141,28 +2531,45 @@
   /**
    * 挂在 document 捕获阶段，页面上每一次点击都会经过这里，所以先做最便宜的判断：
    * 两条触发路径（Alt 点击 / 源码包自动接管）都关掉时直接退出，不碰 DOM 也不解析 URL。
+   *
+   * v1.1.0 拆成两条完全独立的路径：
+   *   A. 点我们注入的加速徽标（data-gha-chip）—— 永远接管，带逐节点故障转移。
+   *      旧版在这里直接 return，把徽标交给浏览器；结果「徽标指向的那个节点刚好挂了」
+   *      就是一次下载失败，用户只能自己回去重试。现在改由脚本挑一个真能通的节点。
+   *   B. 点页面原生的 archive / release / raw 链接 —— 保持原有的 Alt 点击 / 自动接管行为，
+   *      同样换成带故障转移的打开方式。
    */
   function onDocumentClick(e) {
     if (!accelReady()) return;
     if (e.button !== 0 || e.defaultPrevented) return;
-    var byAlt = e.altKey && cfg.altClick;
-    if (!byAlt && !cfg.autoArchive) return;
     if (e.ctrlKey || e.metaKey || e.shiftKey) return;      // 尊重用户"新标签/新窗口"意图
 
     var t = e.target;
     var a = t && t.closest ? t.closest('a[href]') : null;
     if (!a) return;
-    if (a.getAttribute('data-gha-chip') === '1') return;   // 徽标自己就是加速链接
+
+    // ── A. 我们自己的加速徽标：优先且无条件接管 ──
+    if (a.getAttribute('data-gha-chip') === '1') {
+      var origin = stripMirror(a.href);
+      var chipKind = classify(origin);
+      if (!chipKind) return;
+      var need = chipKind === 'blob' ? 'raw' : chipKind;
+      e.preventDefault();
+      e.stopPropagation();
+      openWithFailover(origin, need, a.href);
+      return;
+    }
+
+    // ── B. 页面原生链接：沿用 Alt 点击 / 源码包自动接管 ──
+    var byAlt = e.altKey && cfg.altClick;
+    if (!byAlt && !cfg.autoArchive) return;
     var kind = classify(a.href);
     if (!kind) return;
     if (!byAlt && !(kind === 'archive' && cfg.autoArchive)) return;
 
-    var acc = buildAccel(a.href, kind);
-    if (!acc) return;                                       // 无节点 → 保持原生行为
     e.preventDefault();
     e.stopPropagation();
-    window.open(acc, '_blank', 'noopener');
-    toast('已切换高速通道下载');
+    openWithFailover(stripMirror(a.href), kind === 'blob' ? 'raw' : kind, buildAccel(a.href, kind));
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -2241,6 +2648,9 @@
           });
         } else renderPanel();
       } else if (panelEl) renderPanel();
+      // v1.1.0：常驻看门狗。原来的逻辑只在 boot 时探一次，一旦某轮全网抖动
+      // 把节点全判死，之后网络恢复了也只有用户手动点「重新测速」才会回来。
+      startWatchdog();
     }
 
     document.addEventListener('click', onDocumentClick, true);
@@ -2275,6 +2685,13 @@
           toast('测速完成');
         });
       });
+      // v1.1.0 逃生入口：主站都打不开时，面板多半也点不到，所以必须进菜单
+      if (!onMirrorHost()) {
+        ESCAPE_HOSTS.forEach(function (item) {
+          GM_API.menu('🚪 ' + item.label, function () { openEscape(item); });
+        });
+      }
+      GM_API.menu('📋 复制 GitHub hosts', copyHosts);
       // 菜单项文案注册后不会跟着状态变，所以写成中性的「切换」，避免关掉后还显示「关闭加速」
       GM_API.menu('⏯ 切换加速开关', function () {
         applyEnabled(!cfg.enabled);

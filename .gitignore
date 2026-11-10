@@ -1,0 +1,12 @@
+# serve.bat 本地预览产生的临时目录与别名文件
+.serve/
+*.user.js
+
+# 依赖
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
